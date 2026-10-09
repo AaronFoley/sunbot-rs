@@ -1,24 +1,24 @@
-use crate::{utils::send_err_msg, Context, Error};
+use crate::{constants::SUCCESS_COLOUR, utils::send_err_msg, Context, Error, LavalinkUserData};
 use futures::{future, StreamExt};
 use humantime::format_duration;
+use lavalink_rs::model::player;
 use lavalink_rs::prelude::*;
 use poise::serenity_prelude as serenity;
 use std::ops::Deref;
 use std::time::Duration;
 
-async fn _join(
+pub async fn join_channel(
     ctx: &Context<'_>,
     guild_id: serenity::GuildId,
     channel_id: Option<serenity::ChannelId>,
 ) -> Result<bool, Error> {
-    let lava_client = match &ctx.data().lavalink {
-        Some(x) => x,
-        None => {
-            send_err_msg(*ctx, "Error", "Lavalink client is not available.").await;
-            return Ok(false);
-        }
-    };
-
+    let lock = crate::handlers::punish::audio_lock(guild_id).await;
+    let _guard = lock.lock().await;
+    let lava_client = ctx
+        .data()
+        .lavalink
+        .as_ref()
+        .ok_or_else(|| Error::LavaClientNotAvailable)?;
     let manager = songbird::get(ctx.serenity_context()).await.unwrap().clone();
 
     if lava_client.get_player_context(guild_id).is_none() {
@@ -38,6 +38,7 @@ async fn _join(
                             *ctx,
                             "Error",
                             "You are not in a voice channel, please join one first.",
+                            false,
                         )
                         .await;
                         return Ok(false);
@@ -51,20 +52,21 @@ async fn _join(
         match handler {
             Ok((connection_info, _)) => {
                 lava_client
-                    // The turbofish here is Optional, but it helps to figure out what type to
-                    // provide in `PlayerContext::data()`
-                    //
-                    // While a tuple is used here as an example, you are free to use a custom
-                    // public structure with whatever data you wish.
-                    // This custom data is also present in the Client if you wish to have the
-                    // shared data be more global, rather than centralized to each player.
-                    .create_player_context_with_data::<(serenity::ChannelId, std::sync::Arc<serenity::Http>)>(
+                    .create_player_context_with_data::<LavalinkUserData>(
                         guild_id,
-                        connection_info,
-                        std::sync::Arc::new((
-                            ctx.channel_id(),
-                            ctx.serenity_context().http.clone(),
-                        )),
+                        player::ConnectionInfo {
+                            endpoint: connection_info.endpoint,
+                            session_id: connection_info.session_id,
+                            token: connection_info.token,
+                            channel_id: Some(connect_to.into()),
+                        },
+                        std::sync::Arc::new(LavalinkUserData {
+                            voice_channel: connect_to,
+                            cache: ctx.serenity_context().cache.clone(),
+                            playback_lock: tokio::sync::Mutex::new(()),
+                            channel_id: Some(ctx.channel_id()),
+                            http: ctx.serenity_context().http.clone(),
+                        }),
                     )
                     .await?;
                 return Ok(true);
@@ -74,6 +76,7 @@ async fn _join(
                     *ctx,
                     "Error",
                     format!("Error joining the channel: {}", why).as_str(),
+                    false,
                 )
                 .await;
                 return Err(why.into());
@@ -85,24 +88,22 @@ async fn _join(
 }
 
 /// Play a song in the voice channel you are connected in.
-#[poise::command(slash_command)]
+#[poise::command(slash_command, guild_only)]
 pub async fn play(
     ctx: Context<'_>,
     #[description = "Search term or URL"]
     #[rest]
     term: String,
 ) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
+    ctx.defer().await?;
+    let guild_id = ctx.guild_id().ok_or_else(|| Error::GuildExpected)?;
+    let lava_client = ctx
+        .data()
+        .lavalink
+        .as_ref()
+        .ok_or_else(|| Error::LavaClientNotAvailable)?;
 
-    let lava_client = match &ctx.data().lavalink {
-        Some(x) => x,
-        None => {
-            send_err_msg(ctx, "Error", "Lavalink client is not available.").await;
-            return Ok(());
-        }
-    };
-
-    _join(&ctx, guild_id, None).await?;
+    join_channel(&ctx, guild_id, None).await?;
     let Some(player) = lava_client.get_player_context(guild_id) else {
         return Ok(());
     };
@@ -117,13 +118,15 @@ pub async fn play(
     let mut playlist_info = None;
     let mut tracks: Vec<TrackInQueue> = match loaded_tracks.data {
         Some(TrackLoadData::Track(x)) => vec![x.into()],
-        Some(TrackLoadData::Search(x)) => vec![x[0].clone().into()],
+        Some(TrackLoadData::Search(x)) => {
+            first_search_track(x).into_iter().map(Into::into).collect()
+        }
         Some(TrackLoadData::Playlist(x)) => {
             playlist_info = Some(x.info);
             x.tracks.iter().map(|x| x.clone().into()).collect()
         }
         Some(TrackLoadData::Error(x)) => {
-            send_err_msg(ctx, "Error", x.message.as_str()).await;
+            send_err_msg(ctx, "Error", x.message.as_str(), false).await;
             return Ok(());
         }
         _ => {
@@ -132,6 +135,18 @@ pub async fn play(
         }
     };
 
+    let Some(first_track) = tracks.first() else {
+        send_err_msg(
+            ctx,
+            "No tracks found",
+            "Try a different search or URL.",
+            true,
+        )
+        .await;
+        return Ok(());
+    };
+    let track = first_track.track.clone();
+    let track_count = tracks.len();
     let queue = player.get_queue();
     let mut duration = 0;
     let position = queue.get_count().await.unwrap_or(0) + 1;
@@ -141,14 +156,11 @@ pub async fn play(
         duration += i.track.info.length;
     }
 
-    let track = tracks.remove(0).track;
-    // If there is no track playing, just play the first track
-    if player.get_player().await.unwrap().track.is_none() {
-        player.play(&track).await?;
+    let (start, pending) = split_playback(tracks, player.get_player().await?.track.is_some());
+    if let Some(start) = start {
+        player.play(&start.track).await?;
     }
-
-    // Add the rest of the tracks to the queue
-    queue.append(tracks.clone().into())?;
+    queue.append(pending.into())?;
 
     // If the queue is empty, reply with a hidden message to the user
     if queue.get_count().await.unwrap_or(0) == 0 {
@@ -163,7 +175,7 @@ pub async fn play(
         return Ok(());
     }
 
-    let mut embed = serenity::CreateEmbed::default().color(0x2ECC71);
+    let mut embed = serenity::CreateEmbed::default().color(SUCCESS_COLOUR);
 
     embed = if let Some(info) = playlist_info {
         embed
@@ -172,10 +184,10 @@ pub async fn play(
                     .icon_url(ctx.author().avatar_url().unwrap_or_default()),
             )
             .description(format!("Added playlist {}", info.name))
-            .field("Tracks", tracks.len().to_string(), false)
+            .field("Tracks", track_count.to_string(), false)
             .field(
                 "Position",
-                format!("#{}-{}", position, 1 + tracks.len()),
+                format!("#{}-{}", position, position + track_count - 1),
                 true,
             )
             .field(
@@ -209,15 +221,18 @@ pub async fn play(
 }
 
 /// Join the specified voice channel or the one you are currently in.
-#[poise::command(slash_command)]
+#[poise::command(slash_command, guild_only)]
 pub async fn join(
     ctx: Context<'_>,
     #[description = "The channel ID to join to."]
     #[channel_types("Voice")]
     channel_id: Option<serenity::ChannelId>,
 ) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
-    _join(&ctx, guild_id, channel_id).await?;
+    ctx.defer().await?;
+    let guild_id = ctx.guild_id().ok_or(Error::GuildExpected)?;
+    if !join_channel(&ctx, guild_id, channel_id).await? {
+        return Ok(());
+    }
 
     ctx.send(
         poise::CreateReply::default()
@@ -230,21 +245,21 @@ pub async fn join(
 }
 
 /// Stop Playing music and Leave the current voice channel.
-#[poise::command(slash_command)]
+#[poise::command(slash_command, guild_only)]
 pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
+    ctx.defer().await?;
+    let guild_id = ctx.guild_id().ok_or_else(|| Error::GuildExpected)?;
+    let lock = crate::handlers::punish::audio_lock(guild_id).await;
+    let _guard = lock.lock().await;
     let manager = songbird::get(ctx.serenity_context()).await.unwrap().clone();
-
-    let lava_client = match &ctx.data().lavalink {
-        Some(x) => x,
-        None => {
-            send_err_msg(ctx, "Error", "Lavalink client is not available.").await;
-            return Ok(());
-        }
-    };
+    let lava_client = ctx
+        .data()
+        .lavalink
+        .as_ref()
+        .ok_or_else(|| Error::LavaClientNotAvailable)?;
 
     if lava_client.get_player_context(guild_id).is_none() {
-        send_err_msg(ctx, "Error", "Im not playing anything! :rage:").await;
+        send_err_msg(ctx, "Error", "Im not playing anything! :rage:", false).await;
         return Ok(());
     }
 
@@ -259,27 +274,30 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
             serenity::CreateEmbedAuthor::new("Stopped playing music")
                 .icon_url(ctx.author().avatar_url().unwrap_or_default()),
         )
-        .color(0x2ECC71);
+        .color(SUCCESS_COLOUR);
 
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 
 /// Pauses playing music
-#[poise::command(slash_command)]
+#[poise::command(slash_command, guild_only)]
 pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
-
-    let lava_client = match &ctx.data().lavalink {
-        Some(x) => x,
-        None => {
-            send_err_msg(ctx, "Error", "Lavalink client is not available.").await;
-            return Ok(());
-        }
-    };
+    let guild_id = ctx.guild_id().ok_or_else(|| Error::GuildExpected)?;
+    let lava_client = ctx
+        .data()
+        .lavalink
+        .as_ref()
+        .ok_or_else(|| Error::LavaClientNotAvailable)?;
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
-        send_err_msg(ctx, "Error", "Join the bot to a voice channel first.").await;
+        send_err_msg(
+            ctx,
+            "Error",
+            "Join the bot to a voice channel first.",
+            false,
+        )
+        .await;
         return Ok(());
     };
     player.set_pause(true).await?;
@@ -289,27 +307,30 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
             serenity::CreateEmbedAuthor::new("Paused Music")
                 .icon_url(ctx.author().avatar_url().unwrap_or_default()),
         )
-        .color(0x2ECC71);
+        .color(SUCCESS_COLOUR);
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
 
     Ok(())
 }
 
 /// Resumes playing music
-#[poise::command(slash_command)]
+#[poise::command(slash_command, guild_only)]
 pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
-
-    let lava_client = match &ctx.data().lavalink {
-        Some(x) => x,
-        None => {
-            send_err_msg(ctx, "Error", "Lavalink client is not available.").await;
-            return Ok(());
-        }
-    };
+    let guild_id = ctx.guild_id().ok_or_else(|| Error::GuildExpected)?;
+    let lava_client = ctx
+        .data()
+        .lavalink
+        .as_ref()
+        .ok_or_else(|| Error::LavaClientNotAvailable)?;
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
-        send_err_msg(ctx, "Error", "Join the bot to a voice channel first.").await;
+        send_err_msg(
+            ctx,
+            "Error",
+            "Join the bot to a voice channel first.",
+            false,
+        )
+        .await;
         return Ok(());
     };
 
@@ -320,42 +341,46 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
             serenity::CreateEmbedAuthor::new("Resumed Music")
                 .icon_url(ctx.author().avatar_url().unwrap_or_default()),
         )
-        .color(0x2ECC71);
+        .color(SUCCESS_COLOUR);
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
 
     Ok(())
 }
 
 /// Skip the current song
-#[poise::command(slash_command)]
+#[poise::command(slash_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
+    let guild_id = ctx.guild_id().ok_or(Error::GuildExpected)?;
 
     let lava_client = match &ctx.data().lavalink {
         Some(x) => x,
         None => {
-            send_err_msg(ctx, "Error", "Lavalink client is not available.").await;
+            send_err_msg(ctx, "Error", "Lavalink client is not available.", false).await;
             return Ok(());
         }
     };
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
-        send_err_msg(ctx, "Error", "Join the bot to a voice channel first.").await;
+        send_err_msg(
+            ctx,
+            "Error",
+            "Join the bot to a voice channel first.",
+            false,
+        )
+        .await;
         return Ok(());
     };
 
     player.skip()?;
 
     // If queue is empty and nothing is playing, send a different message
-    if player.get_queue().get_count().await? == 0
-        && player.get_player().await.unwrap().track.is_none()
-    {
+    if player.get_queue().get_count().await? == 0 && player.get_player().await?.track.is_none() {
         let embed = serenity::CreateEmbed::new()
             .author(
                 serenity::CreateEmbedAuthor::new("Skipped")
                     .icon_url(ctx.author().avatar_url().unwrap_or_default()),
             )
-            .color(0x2ECC71)
+            .color(SUCCESS_COLOUR)
             .description("Queue is empty");
         ctx.send(poise::CreateReply::default().embed(embed)).await?;
     } else {
@@ -364,7 +389,7 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
                 serenity::CreateEmbedAuthor::new("Skipped")
                     .icon_url(ctx.author().avatar_url().unwrap_or_default()),
             )
-            .color(0x2ECC71)
+            .color(SUCCESS_COLOUR)
             .description("Skipped the current song");
         ctx.send(poise::CreateReply::default().embed(embed)).await?;
     }
@@ -373,20 +398,23 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 }
 
 /// Displays the current queue
-#[poise::command(slash_command)]
+#[poise::command(slash_command, guild_only)]
 pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
-
-    let lava_client = match &ctx.data().lavalink {
-        Some(x) => x,
-        None => {
-            send_err_msg(ctx, "Error", "Lavalink client is not available.").await;
-            return Ok(());
-        }
-    };
+    let guild_id = ctx.guild_id().ok_or_else(|| Error::GuildExpected)?;
+    let lava_client = ctx
+        .data()
+        .lavalink
+        .as_ref()
+        .ok_or_else(|| Error::LavaClientNotAvailable)?;
 
     let Some(player) = lava_client.get_player_context(guild_id) else {
-        send_err_msg(ctx, "Error", "Join the bot to a voice channel first.").await;
+        send_err_msg(
+            ctx,
+            "Error",
+            "Join the bot to a voice channel first.",
+            false,
+        )
+        .await;
         return Ok(());
     };
 
@@ -399,12 +427,12 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         .take_while(|(idx, _)| future::ready(*idx < max))
         .map(|(idx, x)| {
             format!(
-                "**{} - **[{} - {}](<{}>)\n*Requested By <@!{}>* | {}\n",
+                "**{} - **[{} - {}](<{}>)\n*Requested By {}* | {}\n",
                 idx + 1,
                 x.track.info.author,
                 x.track.info.title,
                 x.track.info.uri.as_ref().unwrap_or(&String::new()),
-                x.track.user_data.unwrap()["requester_id"],
+                requester_label(x.track.user_data.as_ref()),
                 format_duration(Duration::from_millis(x.track.info.length)),
             )
         })
@@ -416,16 +444,16 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         queue_message.push_str(&format!("\n\nAnd {} more...", queue_count - max));
     }
 
-    let song_position = player.get_player().await.unwrap().state.position;
+    let song_position = player.get_player().await?.state.position;
     let now_playing_message = if let Some(track) = player_data.track {
         format!(
-            "[{} - {}](<{}>)\n*Requested by <@!{}>*\n{} Left\n",
+            "[{} - {}](<{}>)\n*Requested by {}*\n{} Left\n",
             track.info.author,
             track.info.title,
             track.info.uri.as_ref().unwrap_or(&String::new()),
-            track.user_data.unwrap()["requester_id"],
+            requester_label(track.user_data.as_ref()),
             format_duration(Duration::from_millis(
-                (track.info.length - song_position) / 1000 * 1000
+                track.info.length.saturating_sub(song_position) / 1000 * 1000
             ))
         )
     } else {
@@ -434,11 +462,57 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
 
     let embed = serenity::CreateEmbed::new()
         .title("Queue")
-        .color(0x2ECC71)
+        .color(SUCCESS_COLOUR)
         .field("Now Playing", now_playing_message, false)
         .field("Queue", queue_message, false);
 
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
 
     Ok(())
+}
+
+fn requester_label(data: Option<&serde_json::Value>) -> String {
+    data.and_then(|value| value.get("requester_id"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|id| format!("<@!{id}>"))
+        .unwrap_or_else(|| "Automatic playback".to_owned())
+}
+
+pub(crate) fn first_search_track(
+    tracks: Vec<lavalink_rs::model::track::TrackData>,
+) -> Option<lavalink_rs::model::track::TrackData> {
+    tracks.into_iter().next()
+}
+
+fn split_playback<T>(tracks: Vec<T>, playing: bool) -> (Option<T>, Vec<T>) {
+    let mut tracks = tracks.into_iter();
+    let start = if playing { None } else { tracks.next() };
+    (start, tracks.collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn empty_search_is_a_normal_no_result() {
+        assert!(first_search_track(vec![]).is_none());
+    }
+    #[test]
+    fn idle_single_track_starts_without_a_second_removal() {
+        assert_eq!(split_playback(vec!["song"], false), (Some("song"), vec![]));
+        assert_eq!(split_playback::<&str>(vec![], false), (None, vec![]));
+    }
+    #[test]
+    fn playlists_keep_order_and_playing_tracks_are_not_replaced() {
+        assert_eq!(split_playback(vec![1, 2, 3], false), (Some(1), vec![2, 3]));
+        assert_eq!(split_playback(vec![1, 2, 3], true), (None, vec![1, 2, 3]));
+    }
+    #[test]
+    fn automatic_tracks_have_a_readable_requester() {
+        assert_eq!(requester_label(None), "Automatic playback");
+        assert_eq!(
+            requester_label(Some(&serde_json::json!({"requester_id": 42}))),
+            "<@!42>"
+        );
+    }
 }

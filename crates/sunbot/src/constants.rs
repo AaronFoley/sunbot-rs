@@ -1,0 +1,2 @@
+pub const ERROR_COLOUR: u32 = 0xFF0000;
+pub const SUCCESS_COLOUR: u32 = 0x2ECC71;

@@ -14,7 +14,7 @@ pub async fn ping(ctx: Context<'_>) -> Result<(), Error> {
 /// Displays information about this bot
 #[poise::command(slash_command)]
 pub async fn about(ctx: Context<'_>) -> Result<(), Error> {
-    let user = ctx.framework().bot_id.to_user(&ctx.http()).await?;
+    let user = ctx.framework().bot_id().to_user(&ctx.http()).await?;
 
     // Somehow get information about the process
     let pid = sysinfo::get_current_pid().expect("Unable to get current process ID");

@@ -83,9 +83,9 @@ pub struct OpenAIAskgpt {
 impl Default for OpenAIAskgpt {
     fn default() -> Self {
         OpenAIAskgpt {
-            model: String::from("gpt-4o"),
+            model: String::from("gpt-6.1-sol"),
             use_vision: true,
-            max_tokens: 500,
+            max_tokens: 4096,
         }
     }
 }
@@ -100,7 +100,7 @@ pub struct OpenAIGenImage {
 impl Default for OpenAIGenImage {
     fn default() -> Self {
         OpenAIGenImage {
-            model: String::from("dall-e-3"),
+            model: String::from("gpt-image-2.5-flare"),
         }
     }
 }
@@ -129,7 +129,7 @@ impl Default for OpenAIAuto {
     fn default() -> Self {
         OpenAIAuto {
             system_context: Vec::new(),
-            model: String::from("gpt-4o"),
+            model: String::from("gpt-6-luna"),
             use_vision: true,
             max_tokens: 100,
             max_messages: 30,

@@ -1,3 +1,4 @@
+use crate::error::Error;
 use lavalink_rs::{model::events, prelude::*};
 use poise::serenity_prelude as serenity;
 use sea_orm::DatabaseConnection;
@@ -8,6 +9,8 @@ use tracing::{info, warn, Level};
 use tracing_subscriber::{filter, prelude::*};
 
 mod commands;
+mod constants;
+mod error;
 mod handlers;
 mod utils;
 
@@ -23,7 +26,14 @@ pub struct Data {
     db: &'static DatabaseConnection,
 }
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
+pub struct LavalinkUserData {
+    voice_channel: serenity::ChannelId,
+    cache: std::sync::Arc<serenity::Cache>,
+    playback_lock: tokio::sync::Mutex<()>,
+    channel_id: Option<serenity::ChannelId>,
+    http: std::sync::Arc<serenity::Http>,
+}
+
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 async fn on_ready(
@@ -52,6 +62,7 @@ async fn on_ready(
             raw: Some(handlers::lavalink::raw_event),
             ready: Some(handlers::lavalink::ready_event),
             track_start: Some(handlers::lavalink::track_start),
+            track_end: Some(handlers::lavalink::track_end),
             ..Default::default()
         };
 
@@ -102,6 +113,7 @@ async fn bot_entrypoint() {
         commands::music::resume(),
         commands::music::skip(),
         commands::music::queue(),
+        commands::punish::punish(),
     ];
 
     let options = poise::FrameworkOptions {
@@ -113,10 +125,15 @@ async fn bot_entrypoint() {
             mention_as_prefix: false,
             ..Default::default()
         },
-        event_handler: |ctx, event, framework, data| {
-            Box::pin(handlers::handler(ctx, event, framework, data))
+        event_handler: |framework, event| {
+            Box::pin(handlers::handler(
+                framework.serenity_context,
+                event,
+                framework,
+            ))
         },
-        on_error: |error| Box::pin(handlers::error_handler(error)),
+        on_error: |error| Box::pin(error::on_error(error)),
+        initialize_owners: true,
         ..Default::default()
     };
 
@@ -146,13 +163,9 @@ fn main() {
         warn!("Sentry initialized with empty DSN - will be disabled")
     }
 
-    let _guard = sentry::init((
-        config.sentry.dsn.as_str(),
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            ..Default::default()
-        },
-    ));
+    let mut sentry_options = sentry::ClientOptions::default();
+    sentry_options.release = sentry::release_name!();
+    let _guard = sentry::init((config.sentry.dsn.as_str(), sentry_options));
 
     // Configure logging with Sentry
     let stdout_log = tracing_subscriber::fmt::layer()

@@ -26,7 +26,7 @@ impl MigrationTrait for Migration {
 }
 
 #[derive(DeriveIden)]
-enum Guild {
+pub enum Guild {
     Table,
     Id,
     JoinedAt,

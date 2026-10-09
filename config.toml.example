@@ -11,3 +11,17 @@ url = "sqlite+aiosqlite:///example.db"
 
 [openai]
 api_key = "apikeygoeshere"
+
+[openai.askgpt]
+model = "gpt-6.1-sol"
+use_vision = true
+# Completion budget includes reasoning tokens.
+max_tokens = 4096
+
+[openai.auto]
+model = "gpt-6-luna"
+use_vision = true
+max_tokens = 100
+
+[openai.genimage]
+model = "gpt-image-2.5-flare"

@@ -1,4 +1,4 @@
-FROM rust:1.81.0-slim-bookworm AS builder
+FROM rust:1.99.0-slim-bookworm AS builder
 
 WORKDIR /sunbot
 
@@ -8,7 +8,7 @@ RUN apt-get update \
     && apt-get autoremove --purge -y $(cat /tmp/cleanup-packages.txt) \
     && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /var/cache/apk/
 
-    # Copy only the Cargo files so that this layer only contains the dependencies
+# Copy only the Cargo files so that this layer only contains the dependencies
 COPY ./Cargo.lock ./Cargo.lock
 COPY ./Cargo.toml ./Cargo.toml
 

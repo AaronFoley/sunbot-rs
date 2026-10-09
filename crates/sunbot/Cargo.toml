@@ -26,6 +26,8 @@ serde_json.workspace = true
 futures.workspace = true
 sea-orm.workspace = true
 base64.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
 
 [build-dependencies]
-built = {version = "0.7.6", features = ["cargo-lock", "chrono", "dependency-tree"]}
+built = {version = "0.8.0", features = ["cargo-lock", "chrono", "dependency-tree"]}

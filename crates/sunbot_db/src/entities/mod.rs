@@ -3,3 +3,6 @@
 pub mod prelude;
 
 pub mod guild;
+pub mod punishment;
+pub mod punishment_channel;
+pub mod punishment_song;

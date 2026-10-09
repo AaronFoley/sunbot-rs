@@ -1,7 +1,7 @@
 use crate::{Data, Error};
 use lazy_static::lazy_static;
 use poise::serenity_prelude as serenity;
-use rand::Rng;
+use rand::RngExt;
 use regex::{Regex, RegexBuilder};
 
 lazy_static! {
@@ -27,7 +27,7 @@ pub async fn handle_message(
                 return Ok(());
             }
             if rand::rng().random::<f64>() < 0.8 {
-                let bot_user = framework.bot_id.to_user(&ctx.http).await?;
+                let bot_user = framework.bot_id().to_user(&ctx.http).await?;
                 message
                     .reply_ping(
                         &ctx.http,

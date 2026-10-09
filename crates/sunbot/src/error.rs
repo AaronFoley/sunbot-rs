@@ -10,6 +10,8 @@ pub enum Error {
     GuildExpected,
     #[error("Audio Streaming is not configured for this bot")]
     LavaClientNotAvailable,
+    #[error("Audio timed out while {0}. Check the Lavalink logs and try again.")]
+    AudioTimeout(&'static str),
     #[error("OpenAI is not configured for this bot")]
     OpenAIUnavailable,
     #[error(
@@ -49,6 +51,7 @@ impl Error {
         matches!(
             self,
             Error::GuildExpected
+                | Error::AudioTimeout(_)
                 | Error::LavaClientNotAvailable
                 | Error::OpenAIUnavailable
                 | Error::InvalidDuration

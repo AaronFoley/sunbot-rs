@@ -7,13 +7,32 @@ use poise::serenity_prelude as serenity;
 use std::ops::Deref;
 use std::time::Duration;
 
+async fn audio_request<T>(
+    stage: &'static str,
+    request: impl std::future::Future<Output = Result<T, lavalink_rs::error::LavalinkError>>,
+) -> Result<T, Error> {
+    tracing::info!(stage, "Starting audio request");
+    match tokio::time::timeout(Duration::from_secs(45), request).await {
+        Ok(result) => {
+            tracing::info!(stage, success = result.is_ok(), "Audio request completed");
+            Ok(result?)
+        }
+        Err(_) => {
+            tracing::warn!(stage, "Audio request timed out");
+            Err(Error::AudioTimeout(stage))
+        }
+    }
+}
+
 pub async fn join_channel(
     ctx: &Context<'_>,
     guild_id: serenity::GuildId,
     channel_id: Option<serenity::ChannelId>,
 ) -> Result<bool, Error> {
     let lock = crate::handlers::punish::audio_lock(guild_id).await;
-    let _guard = lock.lock().await;
+    let _guard = tokio::time::timeout(Duration::from_secs(30), lock.lock())
+        .await
+        .map_err(|_| Error::AudioTimeout("waiting for another voice operation"))?;
     let lava_client = ctx
         .data()
         .lavalink
@@ -47,12 +66,29 @@ pub async fn join_channel(
             }
         };
 
-        let handler = manager.join_gateway(guild_id, connect_to).await;
+        tracing::info!(%guild_id, %connect_to, "Waiting for Discord voice handshake");
+        let handler = match tokio::time::timeout(
+            Duration::from_secs(30),
+            manager.join_gateway(guild_id, connect_to),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(%guild_id, "Discord voice handshake timed out");
+                // Cancel the incomplete call so the next attempt starts fresh.
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), manager.remove(guild_id)).await;
+                return Err(Error::AudioTimeout("connecting to Discord voice"));
+            }
+        };
 
         match handler {
             Ok((connection_info, _)) => {
-                lava_client
-                    .create_player_context_with_data::<LavalinkUserData>(
+                tracing::info!(%guild_id, "Discord voice handshake completed");
+                audio_request(
+                    "creating the Lavalink player",
+                    lava_client.create_player_context_with_data::<LavalinkUserData>(
                         guild_id,
                         player::ConnectionInfo {
                             endpoint: connection_info.endpoint,
@@ -67,8 +103,9 @@ pub async fn join_channel(
                             channel_id: Some(ctx.channel_id()),
                             http: ctx.serenity_context().http.clone(),
                         }),
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 return Ok(true);
             }
             Err(why) => {
@@ -103,7 +140,9 @@ pub async fn play(
         .as_ref()
         .ok_or_else(|| Error::LavaClientNotAvailable)?;
 
+    tracing::info!(%guild_id, "Preparing voice connection for playback");
     join_channel(&ctx, guild_id, None).await?;
+    tracing::info!(%guild_id, "Voice connection prepared for playback");
     let Some(player) = lava_client.get_player_context(guild_id) else {
         return Ok(());
     };
@@ -114,7 +153,8 @@ pub async fn play(
         SearchEngines::YouTube.to_query(&term)?
     };
 
-    let loaded_tracks = lava_client.load_tracks(guild_id, &query).await?;
+    let loaded_tracks =
+        audio_request("loading tracks", lava_client.load_tracks(guild_id, &query)).await?;
     let mut playlist_info = None;
     let mut tracks: Vec<TrackInQueue> = match loaded_tracks.data {
         Some(TrackLoadData::Track(x)) => vec![x.into()],
@@ -156,22 +196,24 @@ pub async fn play(
         duration += i.track.info.length;
     }
 
-    let (start, pending) = split_playback(tracks, player.get_player().await?.track.is_some());
+    let playing = audio_request("checking the player", player.get_player())
+        .await?
+        .track
+        .is_some();
+    let (start, pending) = split_playback(tracks, playing);
     if let Some(start) = start {
-        player.play(&start.track).await?;
+        audio_request("starting playback", player.play(&start.track)).await?;
     }
     queue.append(pending.into())?;
 
-    // If the queue is empty, reply with a hidden message to the user
+    // A single track starts immediately rather than entering the pending queue.
     if queue.get_count().await.unwrap_or(0) == 0 {
-        let resp = ctx
-            .send(
-                poise::CreateReply::default()
-                    .content("Added to queue")
-                    .ephemeral(true),
-            )
-            .await?;
-        resp.delete(ctx).await?;
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("Started playing: {}", track.info.title))
+                .ephemeral(true),
+        )
+        .await?;
         return Ok(());
     }
 
